@@ -18,22 +18,89 @@
 const state=JSON.parse(localStorage.getItem('ladder-state')||'{"sessions":0,"words":0,"missions":0,"age":3,"errors":0}');let soundOn=true,step=0;const $=id=>document.getElementById(id);const lesson=$('lesson'),home=$('home'),grown=$('grown'),stage=$('stage');
 const steps=[
 {phase:'ARRIVE',html:()=>`<div class="eyebrow">Our one job</div><h2>Today we'll slide sounds together.</h2><p class="sub">Listen to every sound. Then say the word fast.</p><button class="primary" onclick="next()">I'm ready</button>`,say:'Today we will slide sounds together. Listen to every sound, then say the word fast.'},
-{phase:'RETRIEVE',html:()=>quiz('Which letter says mmm?','m','s','You remembered the sound mmm.'),say:'Which letter says mmm?'},
-{phase:'RETRIEVE',html:()=>quiz('Which letter says aaa?','a','t','You remembered the sound aaa.'),say:'Which letter says aaa, like the middle of mat?'},
-{phase:'MODEL',html:()=>`<div class="eyebrow">Listen to the slide</div><h2>Hold. Slide. Finish.</h2><div class="word"><span class="new">m</span>a<span class="new">t</span></div><p class="sub">mmmm → aaaa → t → mat</p><button class="replay" onclick="speak('mmmm. aaaa. t. mat.')">↻</button><div class="feedback" aria-live="polite">Tap to hear again</div><button class="primary" onclick="next()">I heard it</button>`,say:'Listen. I hold the first sound, slide without a pause, then finish the word. mmmm, aaaa, t, mat.'},
-{phase:'PRACTICE',html:()=>quiz('Slide the sounds. What word?','mat','sat','Look at every sound: m, a, t.'),say:'Slide the sounds. mmmm, aaaa, t. What word?'},
-{phase:'PRACTICE',html:()=>quiz('Now try a new one.','sat','mat','You changed just one sound.'),say:'Now try a new one. ssss, aaaa, t. What word?'},
+{phase:'RETRIEVE',html:()=>quiz('Which letter says mmm?','m','s','You remembered the sound mmm.'),say:'Which letter says mmm?',hear:()=>speakThen('Which letter says',()=>playSound('m',{fallback:'mmm'}))},
+{phase:'RETRIEVE',html:()=>quiz('Which letter says aaa?','a','t','You remembered the sound aaa.'),say:'Which letter says aaa, like the middle of mat?',hear:()=>speakThen('Which letter says',()=>playSlide(['a'],{hold:.85,after:()=>speak('Like the middle of mat.'),fallback:'aaa, like the middle of mat'}))},
+{phase:'MODEL',html:()=>`<div class="eyebrow">Listen to the slide</div><h2>Hold. Slide. Finish.</h2><div class="word"><span class="new">m</span>a<span class="new">t</span></div><p class="sub">mmmm → aaaa → t → mat</p><button class="replay" onclick="hearStep()">↻</button><div class="feedback" aria-live="polite">Tap to hear again</div><button class="primary" onclick="next()">I heard it</button>`,say:'Listen. I hold the first sound, slide without a pause, then finish the word. mmmm, aaaa, t, mat.',hear:()=>speakThen('Listen. I hold the first sound, slide without a pause, then finish the word.',()=>playSlide(['m','a','t'],{say:'mat',fallback:'mmmm. aaaa. t. mat.'})),replay:()=>playSlide(['m','a','t'],{say:'mat',fallback:'mmmm. aaaa. t. mat.'})},
+{phase:'PRACTICE',html:()=>quiz('Slide the sounds. What word?','mat','sat','Look at every sound: m, a, t.'),say:'Slide the sounds. mmmm, aaaa, t. What word?',hear:()=>speakThen('Slide the sounds.',()=>playSlide(['m','a','t'],{after:()=>speak('What word?'),fallback:'mmmm. aaaa. t. What word?'}))},
+{phase:'PRACTICE',html:()=>quiz('Now try a new one.','sat','mat','You changed just one sound.'),say:'Now try a new one. ssss, aaaa, t. What word?',hear:()=>speakThen('Now try a new one.',()=>playSlide(['s','a','t'],{after:()=>speak('What word?'),fallback:'ssss. aaaa. t. What word?'}))},
 {phase:'READ',html:()=>`<div class="eyebrow">Read it in a sentence</div><h2>Sam sat.</h2><p class="sub">Tap the word you can blend.</p><div class="choices"><button class="choice" onclick="good(this)">Sam</button><button class="choice" onclick="good(this)">sat</button></div><div class="feedback" id="feedback" aria-live="polite">Take your time.</div><button class="primary" id="continue" style="visibility:hidden" onclick="next()">Finish lesson</button>`,say:'Read it in a sentence. Sam sat. Tap a word you can blend.'},
 {phase:'ALL DONE',html:()=>`<div class="success">mat ✓</div><h2>You blended new words.</h2><p class="sub">You looked at every sound and slid them together.</p><div class="mission"><b>Off-screen mission</b>Find a spoon. Say its first sound. Tell a grown-up.</div><button class="primary" onclick="finish()">Done · put the tablet away</button>`,say:'All done. You blended new words. Now find a spoon, say its first sound, and tell a grown-up. Then put the tablet away.'}
 ];
 function save(){localStorage.setItem('ladder-state',JSON.stringify(state));updateDashboard()}
-function speak(text){if(soundOn&&'speechSynthesis'in window){speechSynthesis.cancel();let u=new SpeechSynthesisUtterance(text);u.rate=.82;u.pitch=1.08;speechSynthesis.speak(u)}}
-function quiz(prompt,correct,wrong,praise){return `<div class="eyebrow">Your turn</div><h2>${prompt}</h2><div class="choices"><button class="choice" onclick="answer(this,true,'${praise}')">${correct}</button><button class="choice" onclick="answer(this,false,'${praise}')">${wrong}</button></div><div class="feedback" id="feedback" aria-live="polite">Listen, then choose.</div><button class="replay" onclick="speak('${prompt.replaceAll("'","")}')">↻</button>`}
-function render(){const s=steps[step];$('phase').textContent=s.phase;$('count').textContent=`${step+1} of ${steps.length}`;$('stepbar').innerHTML=steps.map((_,i)=>`<i class="${i<=step?'on':''}"></i>`).join('');stage.innerHTML=s.html();speak(s.say)}
+// --- Phoneme audio: real held sounds and glides, synthesized with Web Audio ---
+// Browser speech cannot stretch phonemes ("mmmm. aaaa." reads as letters), so the
+// slide is built from formants: a sawtooth voice through three bandpass filters whose
+// center frequencies morph between phoneme targets. /s/ is filtered noise, /t/ a burst.
+let ac,slideOffFns=[],noiseBuf=null,hearTk=0;
+function actx(){try{if(!ac){const A=window.AudioContext||window.webkitAudioContext;ac=A?new A():null}if(ac&&ac.state==='suspended')ac.resume()}catch(e){ac=null}return ac}
+function slideOff(){slideOffFns.forEach(f=>{try{f()}catch(e){}});slideOffFns=[]}
+const FORM={m:{f:[280,900,2200],g:[1,.32,.07],bw:[70,90,130]},a:{f:[780,1150,2500],g:[1,.45,.18],bw:[90,110,160]}};
+function getNoise(c){if(!noiseBuf){noiseBuf=c.createBuffer(1,c.sampleRate*2,c.sampleRate);const d=noiseBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1}return noiseBuf}
+function playSlide(seq,opts){
+opts=opts||{};
+if(!soundOn)return;
+const c=actx();
+if(!c){if(opts.fallback)speak(opts.fallback);return}
+if('speechSynthesis'in window)speechSynthesis.cancel();
+slideOff();
+const HOLD=opts.hold||.75,GLIDE=.42,t0=c.currentTime+.08;
+const out=c.createGain();out.gain.value=.8;out.connect(c.destination);
+const vg=c.createGain();vg.gain.value=0;vg.connect(out);
+const osc=c.createOscillator();osc.type='sawtooth';
+const fls=[0,1,2].map(()=>{const b=c.createBiquadFilter();b.type='bandpass';const g=c.createGain();g.gain.value=0;osc.connect(b);b.connect(g);g.connect(vg);return{b,g}});
+const firstV=seq.find(p=>FORM[p]);
+if(firstV)FORM[firstV].f.forEach((f,j)=>{fls[j].b.frequency.value=f;fls[j].b.Q.value=f/FORM[firstV].bw[j];fls[j].g.gain.value=FORM[firstV].g[j]});
+const ns=c.createBufferSource();ns.buffer=getNoise(c);ns.loop=true;
+const nf=c.createBiquadFilter();nf.type='bandpass';nf.frequency.value=5200;nf.Q.value=.55;
+const ng=c.createGain();ng.gain.value=0;ns.connect(nf);nf.connect(ng);ng.connect(out);
+const total=seq.reduce((s,p)=>s+(p==='t'?.34:HOLD),0)+GLIDE*(seq.length-1);
+osc.frequency.setValueAtTime(215,t0);osc.frequency.linearRampToValueAtTime(170,t0+total);
+let t=t0;
+seq.forEach((p,i)=>{
+if(p==='t'){
+vg.gain.setTargetAtTime(0,t,.03);ng.gain.setTargetAtTime(0,t,.03);
+t+=.1;
+const burst=(freq,hp,q,peak,dur)=>{const s=c.createBufferSource();s.buffer=getNoise(c);const f=c.createBiquadFilter();f.type=hp?'highpass':'bandpass';f.frequency.value=freq;if(!hp)f.Q.value=q;const g=c.createGain();g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(peak,t+.008);g.gain.exponentialRampToValueAtTime(.001,t+dur);s.connect(f);f.connect(g);g.connect(out);s.start(t);s.stop(t+dur+.05);slideOffFns.push(()=>s.stop())};
+burst(4200,false,.7,1,.06);burst(1900,true,0,.22,.2);
+t+=.24;return}
+if(p==='s'){
+vg.gain.setTargetAtTime(0,t,.05);
+ng.gain.setTargetAtTime(.8,t,i?GLIDE/3:.06);
+t+=HOLD;return}
+const F=FORM[p],tc=i?GLIDE/3:.03;
+ng.gain.setTargetAtTime(0,t,.06);
+vg.gain.setTargetAtTime(1,t,i?GLIDE/3:.05);
+F.f.forEach((f,j)=>{fls[j].b.frequency.setTargetAtTime(f,t,tc);fls[j].b.Q.setTargetAtTime(f/F.bw[j],t,.03);fls[j].g.gain.setTargetAtTime(F.g[j],t,tc)});
+t+=HOLD});
+vg.gain.setTargetAtTime(0,t,.06);ng.gain.setTargetAtTime(0,t,.06);
+const endT=t+.5;
+osc.start(t0);ns.start(t0);osc.stop(endT);ns.stop(endT);
+slideOffFns.push(()=>{osc.stop()},()=>{ns.stop()});
+const clean=setTimeout(()=>{try{out.disconnect()}catch(e){}},(endT-t0+.5)*1000);
+slideOffFns.push(()=>{clearTimeout(clean);try{out.disconnect()}catch(e){}});
+const afterMs=(t-t0+.18)*1000;
+if(opts.say){const id=setTimeout(()=>{if(soundOn)speak(opts.say)},afterMs);slideOffFns.push(()=>clearTimeout(id))}
+if(opts.after){const id=setTimeout(()=>{if(soundOn)opts.after()},afterMs);slideOffFns.push(()=>clearTimeout(id))}}
+function playSound(p,opts){playSlide([p],Object.assign({hold:.85},opts))}
+function speak(text){slideOff();if(soundOn&&'speechSynthesis'in window){speechSynthesis.cancel();let u=new SpeechSynthesisUtterance(text);u.rate=.82;u.pitch=1.08;speechSynthesis.speak(u)}}
+function speakThen(text,cb){
+if(!soundOn)return;
+const tk=hearTk;
+const go=()=>{if(tk===hearTk&&soundOn&&cb)cb()};
+if(!('speechSynthesis'in window)||!speechSynthesis.getVoices().length){go();return}
+slideOff();
+let done=false;const to=setTimeout(fin,1400+text.length*90);
+function fin(){if(done)return;done=true;clearTimeout(to);go()}
+const u=new SpeechSynthesisUtterance(text);u.rate=.92;u.pitch=1.08;u.onend=fin;u.onerror=fin;
+speechSynthesis.cancel();speechSynthesis.speak(u)}
+function hearStep(){const s=steps[step];if(!soundOn)return;if(s.replay)s.replay();else if(s.hear)s.hear();else speak(s.say)}
+function quiz(prompt,correct,wrong,praise){return `<div class="eyebrow">Your turn</div><h2>${prompt}</h2><div class="choices"><button class="choice" onclick="answer(this,true,'${praise}')">${correct}</button><button class="choice" onclick="answer(this,false,'${praise}')">${wrong}</button></div><div class="feedback" id="feedback" aria-live="polite">Listen, then choose.</div><button class="replay" onclick="hearStep()">↻</button>`}
+function render(){const s=steps[step];$('phase').textContent=s.phase;$('count').textContent=`${step+1} of ${steps.length}`;$('stepbar').innerHTML=steps.map((_,i)=>`<i class="${i<=step?'on':''}"></i>`).join('');stage.innerHTML=s.html();hearTk++;if(s.hear)s.hear();else speak(s.say)}
 function next(){step++;render()}
 function answer(el,ok,praise){const fb=$('feedback');if(ok){el.style.background='#ccebe3';fb.textContent=praise;speak(praise);setTimeout(next,850)}else{state.errors++;el.disabled=true;el.style.opacity=.45;fb.textContent=state.errors%3===1?'Listen again. Look at every sound.':'Let me show you, then you copy.';speak(fb.textContent)}}
 let readTaps=0;function good(el){el.style.background='#ccebe3';el.disabled=true;readTaps++;$('feedback').textContent=readTaps===1?'You read one. Find the other.':'You read the whole sentence.';speak($('feedback').textContent);if(readTaps>=2)$('continue').style.visibility='visible'}
 function finish(){state.sessions++;state.words+=state.age===3?4:6;state.missions++;save();lesson.classList.add('hidden');home.classList.remove('hidden');step=0;readTaps=0;speak('Lesson closed. See you next time.')}
 function updateDashboard(){$('sessions').textContent=state.sessions;$('words').textContent=state.words;$('missionCount').textContent=state.missions;$('blendFill').style.width=Math.min(90,42+state.sessions*12)+'%';$('blendLabel').textContent=state.sessions>=3?'nearly mastered':'learning'}
-$('start').onclick=()=>{home.classList.add('hidden');grown.classList.remove('on');lesson.classList.remove('hidden');step=0;render()};$('grownBtn').onclick=()=>{home.classList.add('hidden');grown.classList.add('on');updateDashboard()};$('back').onclick=()=>{grown.classList.remove('on');home.classList.remove('hidden')};$('reset').onclick=()=>{localStorage.removeItem('ladder-state');location.reload()};$('sound').onclick=()=>{soundOn=!soundOn;$('sound').textContent=soundOn?'Sound on 🔊':'Sound off 🔇';if(!soundOn)speechSynthesis.cancel()};document.querySelectorAll('[data-age]').forEach(b=>b.onclick=()=>{state.age=+b.dataset.age;save();document.querySelectorAll('[data-age]').forEach(x=>x.classList.toggle('active',x===b));$('minutes').textContent=state.age===3?'10':'14'});document.querySelector(`[data-age="${state.age}"]`).click();updateDashboard();
+$('start').onclick=()=>{actx();home.classList.add('hidden');grown.classList.remove('on');lesson.classList.remove('hidden');step=0;render()};$('grownBtn').onclick=()=>{home.classList.add('hidden');grown.classList.add('on');updateDashboard()};$('back').onclick=()=>{grown.classList.remove('on');home.classList.remove('hidden')};$('reset').onclick=()=>{localStorage.removeItem('ladder-state');location.reload()};$('sound').onclick=()=>{soundOn=!soundOn;$('sound').textContent=soundOn?'Sound on 🔊':'Sound off 🔇';if(!soundOn){slideOff();if('speechSynthesis'in window)speechSynthesis.cancel()}};document.querySelectorAll('[data-age]').forEach(b=>b.onclick=()=>{state.age=+b.dataset.age;save();document.querySelectorAll('[data-age]').forEach(x=>x.classList.toggle('active',x===b));$('minutes').textContent=state.age===3?'10':'14'});document.querySelector(`[data-age="${state.age}"]`).click();updateDashboard();
+
 </script></body></html>
